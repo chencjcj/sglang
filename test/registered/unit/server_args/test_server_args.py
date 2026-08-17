@@ -131,6 +131,10 @@ class TestMmEncoderDataParallelLogging(CustomTestCase):
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
+    @staticmethod
+    def _set_model_type(server_args, *, is_multimodal):
+        server_args.model_config = SimpleNamespace(is_multimodal=is_multimodal)
+
     @patch("sglang.srt.server_args.is_cuda", return_value=True)
     def test_cuda_ipc_is_explicit_and_bounded(self, _mock_is_cuda):
         server_args = ServerArgs(
