@@ -27,6 +27,7 @@ from sglang.srt.managers.mm_utils import (
     has_shm_features,
     unwrap_shm_features,
 )
+from sglang.srt.multimodal import mm_timing
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils import (
     broadcast_pyobj,
@@ -253,7 +254,10 @@ class SchedulerRequestReceiver:
         # so that ShmPointerMMData metadata (not full tensor data) is what
         # gets serialized during broadcast_pyobj.
         if recv_reqs:
-            if self.model_config.is_multimodal and has_shm_features(recv_reqs):
+            has_mm_shm = self.model_config.is_multimodal and has_shm_features(
+                recv_reqs
+            )
+            if has_mm_shm:
                 # The broadcast source returns with its original objects while
                 # peer ranks may still be unpickling ShmPointerMMData
                 # (-> shm_open).  Synchronize the same CPU groups that carried
@@ -265,8 +269,12 @@ class SchedulerRequestReceiver:
                         barrier(group=self.attn_cp_cpu_group)
                 elif self.ps.tp_size > 1:
                     barrier(group=self.tp_cpu_group)
-            for req in recv_reqs:
-                unwrap_shm_features(req)
+                with mm_timing.stage("shm_unwrap"):
+                    for req in recv_reqs:
+                        unwrap_shm_features(req)
+            else:
+                for req in recv_reqs:
+                    unwrap_shm_features(req)
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
         work_reqs = [

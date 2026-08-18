@@ -21,6 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalProcessorOutput,
 )
 from sglang.srt.models.kimi_k3 import KimiK3ForConditionalGeneration
+from sglang.srt.multimodal import mm_timing
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
 )
@@ -197,24 +198,28 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                 )
             )
 
-        input_ids = self._prepare_input_ids(
-            input_text, resize_configs, original_input_ids, image_sizes
-        )
+        with mm_timing.stage("token_expand"):
+            input_ids = self._prepare_input_ids(
+                input_text, resize_configs, original_input_ids, image_sizes
+            )
 
         image_scale, image_bias = self._get_gpu_norm_tensors()
         # Shared source-compatible batched pipeline (same as K2.5): RGBA
         # inputs land in their own source-shape groups, and the
         # transparent-background compositing runs on each resized batch
         # before patchify -- identical order to the previous per-image path.
-        pixel_values, grid_thws = _gpu_preprocess_images(
-            images,
-            resize_configs,
-            image_scale,
-            image_bias,
-            self._patch_size,
-            to_chw=_k3_to_cuda_chw,
-            post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
-        )
+        with mm_timing.stage("gpu_preprocess", gpu_sync=True):
+            pixel_values, grid_thws = _gpu_preprocess_images(
+                images,
+                resize_configs,
+                image_scale,
+                image_bias,
+                self._patch_size,
+                to_chw=_k3_to_cuda_chw,
+                post_resize=lambda x: _fill_transparent_bg(
+                    x, self._transparent_bg_config
+                ),
+            )
 
         return {
             "input_ids": input_ids,

@@ -1672,18 +1672,23 @@ def _load_image(
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
     """
+    from sglang.srt.multimodal import mm_timing
+
     if image_file != "":
-        image_bytes = get_image_bytes(image_file)
+        with mm_timing.stage("img_fetch_bytes"):
+            image_bytes = get_image_bytes(image_file)
     if is_jpeg_with_cuda(image_bytes, gpu_image_decode):
         try:
-            encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            with mm_timing.stage("img_decode_nvjpeg", gpu_sync=True):
+                encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+                image_tensor = decode_jpeg(encoded_image, device="cuda")
             return image_tensor
         except Exception as e:
             logger.warning(
                 f"Failed to decode JPEG on GPU, falling back to CPU. Error: {e}"
             )
-    return Image.open(BytesIO(image_bytes))
+    with mm_timing.stage("img_decode_pil"):
+        return Image.open(BytesIO(image_bytes))
 
 
 def load_image(

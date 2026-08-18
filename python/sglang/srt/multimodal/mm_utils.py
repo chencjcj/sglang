@@ -41,6 +41,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.multimodal import mm_timing
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import flatten_nested_list
 
@@ -103,11 +104,12 @@ def materialize_multimodal_features(
         device=device,
         dtype=dtype,
     )
-    offset = 0
-    for feature in features:
-        length = feature.shape[0]
-        output[offset : offset + length].copy_(feature, non_blocking=True)
-        offset += length
+    with mm_timing.stage("feature_h2d", gpu_sync=True):
+        offset = 0
+        for feature in features:
+            length = feature.shape[0]
+            output[offset : offset + length].copy_(feature, non_blocking=True)
+            offset += length
     return output
 
 

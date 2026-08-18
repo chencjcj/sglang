@@ -19,6 +19,7 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal import mm_timing
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
@@ -666,9 +667,10 @@ class BaseMultimodalProcessor(ABC):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
-                if discard_alpha_channel and img.mode != "RGB":
-                    return img.convert("RGB")
-                img.load()
+                with mm_timing.stage("img_decode_pil_load"):
+                    if discard_alpha_channel and img.mode != "RGB":
+                        return img.convert("RGB")
+                    img.load()
                 return img
             elif modality == Modality.VIDEO:
                 return load_video(data, frame_count_limit)
@@ -1404,12 +1406,14 @@ class BaseMultimodalProcessor(ABC):
             return
 
         for item in mm_items:
-            item.set_pad_value()
+            with mm_timing.stage("feature_hash", gpu_sync=True):
+                item.set_pad_value()
             if not self.keep_mm_features_on_device:
-                item.feature = self._move_feature_to_cpu(item.feature)
-                item.precomputed_embeddings = self._move_feature_to_cpu(
-                    item.precomputed_embeddings
-                )
+                with mm_timing.stage("feature_d2h", gpu_sync=True):
+                    item.feature = self._move_feature_to_cpu(item.feature)
+                    item.precomputed_embeddings = self._move_feature_to_cpu(
+                        item.precomputed_embeddings
+                    )
 
     def resolve_image_token_counts(self, images: List) -> List[int]:
         """Per-image expanded token counts, computed without re-tokenizing.
