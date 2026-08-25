@@ -126,6 +126,13 @@ class TestCacheConfig(CustomTestCase):
             ("revision", "v2"),
             ("device_capability", "9.0"),
             ("torch_version", "2.4.0"),
+            # Selects the post-load branch for MXFP4, so a daemon and client
+            # that resolved different runners must not share weights.
+            ("moe_runner_backend", "flashinfer_mxfp4"),
+            # Same, via the other route into that branch: MXFP4 reaches the
+            # exportable MegaMoE layout on --moe-a2a-backend megamoe even when
+            # the runner stays "auto" (mxfp4.py: use_mega_moe).
+            ("moe_a2a_backend", "megamoe"),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),
@@ -190,6 +197,65 @@ class TestGlobalRankAndPaths(CustomTestCase):
         self.assertTrue(get_socket_path(3).endswith("rank3.sock"))
         self.assertTrue(get_ready_path(3).endswith("rank3.ready"))
 
+class TestDaemonCommand(CustomTestCase):
+    """Every fingerprinted setting must reach the spawned daemon.
+
+    Regression guard: the engine-spawned path once omitted the MoE backends,
+    so the daemon resolved none/auto, took a different
+    process_weights_after_loading branch, and failed the handshake.
+    """
+
+    @staticmethod
+    def _cmd(**overrides):
+        from sglang.srt.weight_cache.daemon import build_daemon_command
+
+        base = dict(
+            python_executable="/usr/bin/python3",
+            model_path="/models/demo",
+            gpu_id=1,
+            tp_size=8,
+            tp_rank=1,
+            pp_size=1,
+            pp_rank=0,
+            dp_size=1,
+            ep_size=8,
+            load_format="auto",
+            dtype="auto",
+            moe_a2a_backend="megamoe",
+            moe_runner_backend="auto",
+            dist_init_method="tcp://127.0.0.1:1234",
+        )
+        base.update(overrides)
+        return build_daemon_command(**base)
+
+    def _flag_value(self, cmd, flag):
+        return cmd[cmd.index(flag) + 1]
+
+    def test_moe_backends_are_forwarded(self):
+        cmd = self._cmd()
+        self.assertEqual(self._flag_value(cmd, "--moe-a2a-backend"), "megamoe")
+        self.assertEqual(self._flag_value(cmd, "--moe-runner-backend"), "auto")
+
+    def test_optional_flags_are_omitted_when_unset(self):
+        cmd = self._cmd()
+        for flag in (
+            "--quantization",
+            "--trust-remote-code",
+            "--revision",
+            "--model-loader-extra-config",
+        ):
+            self.assertNotIn(flag, cmd)
+
+    def test_empty_loader_config_is_not_forwarded(self):
+        # "{}" is the default, not a user setting; forwarding it is noise.
+        self.assertNotIn(
+            "--model-loader-extra-config", self._cmd(model_loader_extra_config="{}")
+        )
+        self.assertIn(
+            "--model-loader-extra-config",
+            self._cmd(model_loader_extra_config='{"num_threads":8}'),
+        )
+
     def test_compute_local_gpu_id_honors_base_and_step(self):
         # Single-node TP=4: identity mapping rank -> gpu.
         self.assertEqual(
@@ -244,7 +310,48 @@ class TestIpcQuantAllowlist(CustomTestCase):
 
     def test_allowlist_registry_shape(self):
         # Guard against accidentally widening the allowlist without review.
-        self.assertEqual(set(IPC_QUANT_ALLOWLIST), {"", "fp8"})
+        self.assertEqual(
+            set(IPC_QUANT_ALLOWLIST),
+            {"", "fp8", "mxfp4", "compressed_tensors", "compressed-tensors"},
+        )
+
+    def test_mxfp4_rejected_off_the_megamoe_branch(self):
+        """MXFP4 is only IPC-safe on the DeepGEMM/MegaMoE post-load branch.
+
+        The other branches permute weights or stamp `is_shuffled` on the
+        Parameter, neither of which survives a raw-tensor IPC export, so the
+        predicate must consult the resolved MoE runner rather than trusting the
+        checkpoint's format string. Without a resolved runtime the runner
+        lookup fails closed.
+        """
+        mxfp4_ct_config = {
+            "format": "mxfp4-pack-quantized",
+            "config_groups": {"group_0": {"format": "mxfp4-pack-quantized"}},
+        }
+        for method, config in (
+            ("mxfp4", None),
+            ("compressed_tensors", mxfp4_ct_config),
+        ):
+            with self.subTest(method=method):
+                self.assertFalse(is_ipc_quant_supported(method, config))
+
+    def test_non_mxfp4_compressed_tensors_rejected(self):
+        """A compressed-tensors name says nothing about the scheme inside.
+
+        CompressedTensorsConfig.get_name() is "compressed_tensors" for W4A8
+        INT4, W8A8 and MXFP4 alike, so the predicate must inspect the format.
+        Only the MXFP4 dispatch (Mxfp4MoEMethod) is verified; deleting this
+        case would let any compressed-tensors checkpoint through the gate.
+        """
+        for config in (
+            None,
+            {"format": "pack-quantized"},
+            {"config_groups": {"group_0": {"format": "int-quantized"}}},
+        ):
+            with self.subTest(config=config):
+                self.assertFalse(
+                    is_ipc_quant_supported("compressed_tensors", config)
+                )
 
 
 class TestCleanupStaleDaemonFiles(CustomTestCase):

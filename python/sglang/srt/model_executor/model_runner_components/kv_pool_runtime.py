@@ -52,9 +52,12 @@ def compute_post_capture_kv_resize(
         distributed=get_world_group().world_size > 1,
         cpu_group=get_world_group().cpu_group,
     )
-    headroom_gb = model_runner.pre_model_load_memory * (
-        1 - model_runner.mem_fraction_static
-    )
+    # Same corrected baseline the pre-capture sizing uses: weights a daemon
+    # already held are absent from pre_model_load_memory but present on the
+    # device, so the slack derived from it would be short by that much.
+    headroom_gb = (
+        model_runner.pre_model_load_memory + model_runner.preloaded_weights_gb
+    ) * (1 - model_runner.mem_fraction_static)
     decode_cuda_graph_config = model_runner.server_args.cuda_graph_config.decode
     decode_max_bs = int(decode_cuda_graph_config.max_bs or 0)
     running_requests = int(model_runner.max_running_requests or decode_max_bs or 1)

@@ -6,6 +6,7 @@ memory needed — engine and daemon share the same physical GPU memory via CUDA 
 Engine depends on daemon staying alive.
 """
 
+import inspect
 import logging
 import os
 import signal
@@ -76,6 +77,7 @@ class IpcModelLoader(BaseModelLoader):
         self.weight_cache_mode = weight_cache_mode
         self._fallback_loader_cls = fallback_loader_cls
         self._fallback_load_format = fallback_load_format
+        self.preloaded_weights_bytes = 0
 
     def load_model(
         self,
@@ -89,6 +91,7 @@ class IpcModelLoader(BaseModelLoader):
         (fallback to disk loading would cause OOM on shared GPUs).
         In client mode, falls back to DefaultModelLoader.
         """
+        self.preloaded_weights_bytes = 0
         tic = time.perf_counter()
 
         # Hard-gate unsupported quant methods before touching the daemon, so an
@@ -118,6 +121,19 @@ class IpcModelLoader(BaseModelLoader):
             return self._fallback_load(model_config, device_config)
 
         entries = cache_data["entries"]
+        # Older daemons omit this field; missing metadata means no correction.
+        preloaded_weights_bytes = cache_data.get("preloaded_weights_bytes", 0)
+        if preloaded_weights_bytes is None:
+            preloaded_weights_bytes = 0
+        if (
+            isinstance(preloaded_weights_bytes, bool)
+            or not isinstance(preloaded_weights_bytes, int)
+            or preloaded_weights_bytes < 0
+        ):
+            raise RuntimeError(
+                "[IpcModelLoader] Daemon returned invalid weight-memory metadata: "
+                f"{preloaded_weights_bytes=}"
+            )
         logger.info(
             f"[IpcModelLoader] Fetched {len(entries)} IPC handles from daemon "
             f"in {time.perf_counter() - tic:.2f}s"
@@ -135,6 +151,7 @@ class IpcModelLoader(BaseModelLoader):
             entries,
             quant_config,
         )
+        self.preloaded_weights_bytes = preloaded_weights_bytes
 
         # Skip _post_load_weights: the daemon already ran
         # process_weights_after_loading on the weights before exporting
@@ -147,6 +164,14 @@ class IpcModelLoader(BaseModelLoader):
         # replaced via IPC mapping, these views still point to the old
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
+
+        # Restore the post-load state that lives outside state_dict() and so
+        # could not cross IPC (quant-method aliasing tuples and flags, then
+        # the model's own derived GPU tensors).
+        self._rebuild_mxfp4_mega_moe_state(
+            model, cache_data.get("mega_moe_modules") or []
+        )
+        self._rerun_idempotent_post_load(model)
 
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.
@@ -221,31 +246,136 @@ class IpcModelLoader(BaseModelLoader):
         return quant_method, quant_config
 
     @staticmethod
+    def _rerun_idempotent_post_load(model) -> bool:
+        """Re-run post_load_weights for models that declare it IPC-safe.
+
+        The generic path skips _post_load_weights, since running a quant
+        method's post-processing twice would corrupt already-processed tensors.
+        But some models also derive plain-Python GPU state there (K3's fused
+        decode argument stashes), which is neither a parameter nor a buffer, so
+        the daemon cannot export it and it stays unset.
+
+        Opt in via ipc_post_load_weights_is_idempotent, which asserts
+        post_load_weights derives only from already-loaded weights and never
+        requantizes. Do not set it without checking that.
+
+        Models that additionally take adopt_derived_tensors get it set: their
+        large derived tensors are non-persistent buffers the daemon already
+        exported, and rebuilding them here would be a net allocation on top of
+        the mapped originals -- the source storage is the daemon's and cannot
+        be freed to pay for the swap the off-IPC path gets for free.
+        """
+        if not getattr(model, "ipc_post_load_weights_is_idempotent", False):
+            return False
+        if not hasattr(model, "post_load_weights"):
+            return False
+
+        adopts = (
+            "adopt_derived_tensors"
+            in inspect.signature(model.post_load_weights).parameters
+        )
+        tic = time.perf_counter()
+        if adopts:
+            model.post_load_weights(adopt_derived_tensors=True)
+        else:
+            model.post_load_weights()
+        logger.info(
+            f"[IpcModelLoader] Re-ran post_load_weights for "
+            f"{type(model).__name__} in {time.perf_counter() - tic:.2f}s "
+            f"(adopt_derived_tensors={adopts})"
+        )
+        return True
+
+    @staticmethod
+    def _rebuild_mxfp4_mega_moe_state(model, mega_moe_modules) -> int:
+        """Re-alias the MegaMoE weight tuples the MXFP4 post-load built.
+
+        ``mega_moe_modules`` names the modules the daemon actually took down
+        the mega branch. Matching structurally instead would also hit experts
+        that ran a different branch, and the two flags set below are build-once
+        short-circuits -- forcing them on is a silent numerics error.
+
+        Mxfp4MoEMethod.process_weights_after_loading repoints w13/w2 weight and
+        scale params at the mega tensors themselves, so every mega byte reaches
+        us through state_dict(). What does not is the Python-side aliasing:
+        mega_l{1,2}_weights are plain tuples the mega path reads directly.
+
+        Do NOT re-run the UTCCP transpose here: the params already hold the
+        transposed layout, so a second pass would serve doubly-transposed
+        scales and allocate a full extra copy on top of the mapped originals.
+        """
+        if not mega_moe_modules:
+            return 0
+
+        by_name = dict(model.named_modules())
+        count = 0
+        missing = []
+        for name in mega_moe_modules:
+            module = by_name.get(name)
+            if module is None:
+                missing.append(name)
+                continue
+            module.mega_l1_weights = (
+                module.w13_weight.data,
+                module.w13_weight_scale.data,
+            )
+            module.mega_l2_weights = (
+                module.w2_weight.data,
+                module.w2_weight_scale.data,
+            )
+            # Gates should_use_mega_moe() and the build-once guards in every
+            # mxfp4_*_moe backend; without it the mega path is skipped and K3
+            # has no non-mega fallback.
+            module._mega_moe_weights_built = True
+            module._mxfp4_backend = "deep_gemm"
+            count += 1
+
+        if missing:
+            raise RuntimeError(
+                f"[IpcModelLoader] The daemon reported {len(missing)} MegaMoE "
+                f"modules this model does not have: {missing[:5]}. The two "
+                f"processes built different module trees; serving would run "
+                f"the mega path on the wrong experts. First: {missing[0]}"
+            )
+        return count
+
+    @staticmethod
     def _rebuild_stale_views(model):
         """Rebuild tensor views that went stale after IPC weight replacement.
 
-        RadixLinearAttention.conv_weights is a view of conv1d.weight created
-        during __init__. After IPC mapping replaces conv1d.weight with a new
-        tensor, the old view still points to meta-device storage. Recreate
+        RadixLinearAttention.conv_weights is a view of the owning module's
+        conv1d weight, taken during __init__. After IPC mapping replaces that
+        weight with a new tensor, the old view still points at meta-device
+        storage -- a Triton kernel then rejects it as a CPU pointer. Recreate
         it from the now-valid parameter.
+
+        The owning attribute is named per model (K3's KDA layer calls it
+        qkv_conv1d), so search for whichever one this module carries.
         """
         try:
             from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
         except ImportError:
             return
 
+        conv_attr_names = ("conv1d", "qkv_conv1d")
         count = 0
         for _, module in model.named_modules():
-            conv1d = getattr(module, "conv1d", None)
             attn = getattr(module, "attn", None)
-            if conv1d is not None and isinstance(attn, RadixLinearAttention):
-                if hasattr(conv1d, "weight") and conv1d.weight is not None:
-                    attn.conv_weights = conv1d.weight.view(
-                        conv1d.weight.size(0), conv1d.weight.size(2)
-                    )
-                    if hasattr(conv1d, "bias") and conv1d.bias is not None:
-                        attn.bias = conv1d.bias
-                    count += 1
+            if not isinstance(attn, RadixLinearAttention):
+                continue
+            for conv_attr in conv_attr_names:
+                conv1d = getattr(module, conv_attr, None)
+                weight = getattr(conv1d, "weight", None)
+                if weight is None:
+                    continue
+                # K3 unsqueezes the [dim, kernel] checkpoint weight to
+                # [dim, 1, kernel] at build time; squeeze back to the 2D view
+                # the linear-attn kernels index.
+                attn.conv_weights = weight.view(weight.size(0), weight.size(-1))
+                if getattr(conv1d, "bias", None) is not None:
+                    attn.bias = conv1d.bias
+                count += 1
+                break
 
         if count > 0:
             logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
@@ -283,6 +413,25 @@ class IpcModelLoader(BaseModelLoader):
             elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
                 delattr(obj, leaf_name)
             obj.register_buffer(leaf_name, tensor)
+
+    @staticmethod
+    def _decode_entry(entry):
+        """Materialize one daemon entry as a tensor.
+
+        A CUDA entry carries an IPC handle and maps zero-copy. A CPU entry
+        carries its bytes inline (the daemon cannot IPC-export host memory)
+        and is rebuilt here, on CPU, where the model expects it.
+        """
+        if "handle" in entry:
+            return MultiprocessingSerializer.deserialize(entry["handle"])
+        dtype = getattr(torch, entry["dtype"])
+        # The daemon serializes through a uint8 view; the bytes carry no
+        # dtype of their own.
+        return (
+            torch.frombuffer(bytearray(entry["data"]), dtype=torch.uint8)
+            .view(dtype)
+            .reshape(entry["shape"])
+        )
 
     def _load_zero_copy_mode(
         self,
@@ -324,7 +473,9 @@ class IpcModelLoader(BaseModelLoader):
             name: param
             for name, param in model.named_parameters(remove_duplicate=False)
         }
-        existing_buffers = {name: buf for name, buf in model.named_buffers()}
+        existing_buffers = {
+            name: buf for name, buf in model.named_buffers(remove_duplicate=False)
+        }
         existing_names = set(existing_params) | set(existing_buffers)
 
         imported_refs = []
@@ -337,22 +488,27 @@ class IpcModelLoader(BaseModelLoader):
         # This ensures post-quantization parameters (weight_scale, etc.)
         # that were created by process_weights_after_loading are also mapped.
         for name, entry in entries.items():
-            imported_tensor = MultiprocessingSerializer.deserialize(entry["handle"])
+            imported_tensor = self._decode_entry(entry)
             is_param = entry.get("is_param", True)
 
             if name in existing_names:
-                # Existing parameter/buffer — validate shape/dtype
+                # The daemon's tensors are post-_post_load_weights; the meta
+                # skeleton is pre. A quant method's post-load may reinterpret a
+                # tensor in place (MXFP4/DeepGEMM views packed weights as int8
+                # and repacks e8m0 scales from uint8 [.., 112] to int32
+                # [.., 28]) -- shape and dtype change, byte count never does.
                 if name in existing_params:
                     ref_param = existing_params[name]
                 else:
                     ref_param = existing_buffers[name]
-                if (
-                    imported_tensor.shape != ref_param.shape
-                    or imported_tensor.dtype != ref_param.dtype
-                ):
+                imported_bytes = imported_tensor.numel() * imported_tensor.element_size()
+                ref_bytes = ref_param.numel() * ref_param.element_size()
+                if imported_bytes != ref_bytes:
                     mismatched.append(
-                        f"  {name}: IPC={imported_tensor.shape}/{imported_tensor.dtype} "
-                        f"vs model={ref_param.shape}/{ref_param.dtype}"
+                        f"  {name}: IPC={imported_tensor.shape}/"
+                        f"{imported_tensor.dtype} ({imported_bytes} B) "
+                        f"vs model={ref_param.shape}/{ref_param.dtype} "
+                        f"({ref_bytes} B)"
                     )
                     del imported_tensor
                     continue
@@ -367,9 +523,11 @@ class IpcModelLoader(BaseModelLoader):
 
         if mismatched:
             raise RuntimeError(
-                f"[IpcModelLoader] {len(mismatched)} tensor(s) have shape/dtype "
-                f"mismatch between the IPC daemon and the meta-initialized model. "
-                f"The quantization method passed the IPC allowlist gate "
+                f"[IpcModelLoader] {len(mismatched)} tensor(s) differ in byte "
+                f"size between the IPC daemon and the meta-initialized model. "
+                f"A post-load reinterpretation (shape/dtype change at equal "
+                f"bytes) is allowed and is not what this reports. The "
+                f"quantization method passed the IPC allowlist gate "
                 f"(check_ipc_quant_support), so this is NOT an unsupported-quant "
                 f"case — it indicates the daemon's weight fingerprint is "
                 f"incomplete or the daemon/client configs drifted (a bug to fix), "

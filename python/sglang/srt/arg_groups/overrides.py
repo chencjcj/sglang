@@ -579,6 +579,11 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # back to BF16 weight materialization during model loading.
     if server_args.moe_runner_backend != "auto":
         return {}
+    # megamoe is selected through the a2a arg, which leaves the runner "auto";
+    # forcing flashinfer_mxfp4 here would override an explicit user choice and
+    # mislabel the env stamp the weight cache fingerprints.
+    if server_args.moe_a2a_backend == "megamoe":
+        return {}
     if not (is_sm100_supported() and get_device_sm() in (100, 103, 107)):
         return {}
     if not _is_mxfp4_pack_quantized(hf_config):

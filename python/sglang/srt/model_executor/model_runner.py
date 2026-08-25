@@ -312,6 +312,10 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        # Weights a weight-cache daemon already held when pre_model_load_memory
+        # was sampled; added to that baseline at KV sizing. See
+        # account_preloaded_weights.
+        self.preloaded_weights_gb = 0.0
         # Set the global server_args in the scheduler process (target worker
         # only, so a draft init cannot clobber target-derived global state).
         # Before the constructor's bag reads (page_size below): a standalone
@@ -796,6 +800,19 @@ class ModelRunner:
         capture_bs, _ = get_batch_sizes_to_capture(self, num_tokens_per_req)
         return max(capture_bs) * num_tokens_per_req
 
+    @property
+    def preloaded_weights_bytes(self) -> int:
+        # BaseModelLoader defines this with a 0 default, and the client already
+        # validated the value it parsed off the socket.
+        return self.loader.preloaded_weights_bytes
+
+    def account_preloaded_weights(self, preloaded_weights_bytes: int) -> None:
+        """Record weights a daemon already held when the baseline was sampled."""
+        # Assigned, not accumulated: dist-init sampled the baseline after the
+        # daemon held its weights, so slack is short by exactly this much. A
+        # second call re-states the same correction rather than doubling it.
+        self.preloaded_weights_gb = preloaded_weights_bytes / (1 << 30)
+
     def alloc_memory_pool(self, memory_pool_config: Optional[MemoryPoolConfig] = None):
         """Allocate KV cache memory pools only (no backends or cuda graphs)."""
         if memory_pool_config is not None:
@@ -804,6 +821,7 @@ class ModelRunner:
         self.init_kv_cache_configurator()
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
+            + self.preloaded_weights_gb
         )
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests

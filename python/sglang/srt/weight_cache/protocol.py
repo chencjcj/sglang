@@ -52,6 +52,12 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    # Both select the post-load branch: MXFP4 reaches the exportable
+    # DeepGEMM/MegaMoE path via either the deep_gemm runner or the megamoe a2a
+    # backend (mxfp4.py, use_deep_gemm / use_mega_moe), so a daemon and client
+    # that resolved either differently must not share weights.
+    moe_runner_backend: str = ""
+    moe_a2a_backend: str = ""
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -155,11 +161,98 @@ def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
     return _get_quant_field(quant_config, "weight_block_size") is not None
 
 
+def _mxfp4_round_trips_via_ipc(_quant_config: Any) -> bool:
+    """MXFP4 round-trips only on the DeepGEMM/MegaMoE post-load branch.
+
+    That branch (Mxfp4MoEMethod, mxfp4.py) repoints w13/w2 weight and scale
+    params at the transformed tensors, so every transformed byte lands in
+    state_dict() and crosses IPC; _rebuild_mxfp4_mega_moe_state restores the
+    Python-side aliasing that does not.
+
+    The other MXFP4 branches are NOT covered and must stay rejected:
+    flashinfer/trtllm and the SM90/SM120 cutlass paths permute weights into
+    shapes the meta-init client cannot reproduce, Marlin repacks, and both
+    Mxfp4DynamicQuantMoEMethod and the ROCm aiter path stamp `is_shuffled` on
+    the Parameter (read back via getattr in apply()) which IPC drops. Gate on
+    the runner backend actually selected, not on the checkpoint alone.
+
+    This is a *runtime* gate: on SM100/103/107 the K3 override resolves
+    moe_runner_backend=flashinfer_mxfp4 by default, which is rejected here --
+    reaching the supported branch needs an explicit --moe-a2a-backend megamoe
+    (or --moe-runner-backend deep_gemm).
+    """
+    # Fail closed: if the runner cannot be resolved we cannot prove which
+    # post-load branch ran, and guessing wrong serves wrong numerics.
+    try:
+        from sglang.srt.layers.moe import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+
+        if _use_aiter_mxfp4():
+            return False
+        return (
+            get_moe_runner_backend().is_deep_gemm()
+            or get_moe_a2a_backend().is_megamoe()
+        )
+    except Exception:
+        logger.warning(
+            "[weight_cache] Could not resolve the MoE runner backend; treating "
+            "MXFP4 as unsupported for IPC zero-copy sharing."
+        )
+        return False
+
+
+def _use_aiter_mxfp4() -> bool:
+    from sglang.srt.layers.quantization.mxfp4 import _use_aiter
+
+    return _use_aiter
+
+
+def _compressed_tensors_round_trips_via_ipc(quant_config: Any) -> bool:
+    """Only compressed-tensors checkpoints that dispatch to MXFP4 MoE.
+
+    CompressedTensorsConfig.get_name() is "compressed_tensors" regardless of
+    the scheme inside, so the method name alone says nothing about IPC safety.
+    Kimi-K3's checkpoint declares format "mxfp4-pack-quantized" and routes to
+    Mxfp4MoEMethod (compressed_tensors.py:_is_mxfp4_moe), which puts it under
+    the same branch rule as _mxfp4_round_trips_via_ipc. Every other
+    compressed-tensors scheme (W4A8 INT4, W8A8, ...) is unverified and stays
+    rejected.
+    """
+    if not _is_mxfp4_pack_quantized_config(quant_config):
+        return False
+    return _mxfp4_round_trips_via_ipc(quant_config)
+
+
+def _is_mxfp4_pack_quantized_config(quant_config: Any) -> bool:
+    """True iff a compressed-tensors config carries an mxfp4 format.
+
+    Mirrors arg_groups/overrides.py:_is_mxfp4_pack_quantized: the format may
+    sit at the top level or per config_group (compressed-tensors sets the
+    top-level format to "mixed-precision" when groups disagree).
+    """
+    if "mxfp4" in str(_get_quant_field(quant_config, "format") or ""):
+        return True
+    groups = _get_quant_field(quant_config, "config_groups") or {}
+    if not isinstance(groups, dict):
+        return False
+    return any(
+        "mxfp4" in str(group.get("format", ""))
+        for group in groups.values()
+        if isinstance(group, dict)
+    )
+
+
 # quant_method name -> predicate(quant_config) -> bool (True == verified safe).
 # A method absent from this registry is unsupported and hard-errors.
 IPC_QUANT_ALLOWLIST = {
     "": lambda _quant_config: True,  # unquantized
     "fp8": _fp8_round_trips_via_ipc,  # only block-wise FP8 verified
+    "mxfp4": _mxfp4_round_trips_via_ipc,  # only the DeepGEMM/MegaMoE branch
+    # K3 ships MXFP4 under the compressed-tensors wrapper.
+    "compressed_tensors": _compressed_tensors_round_trips_via_ipc,
+    "compressed-tensors": _compressed_tensors_round_trips_via_ipc,
 }
 
 
@@ -192,8 +285,10 @@ def check_ipc_quant_support(
         f"meta-initialized client cannot reproduce, which would silently serve "
         f"wrong-numerics weights. Verified methods: {verified}. Note: FP8 is "
         f"only verified for block-wise configs (weight_block_size set), not "
-        f"per-tensor FP8. Disable the weight cache (--weight-cache-mode off) "
-        f"for this model."
+        f"per-tensor FP8; MXFP4 only on the DeepGEMM/MegaMoE runner branch "
+        f"(--moe-runner-backend deep_gemm or --moe-a2a-backend megamoe), not "
+        f"flashinfer/trtllm, cutlass, Marlin, or ROCm aiter. Disable the "
+        f"weight cache (--weight-cache-mode off) for this model."
     )
 
 
@@ -263,7 +358,28 @@ def compute_env_stamp() -> Dict[str, str]:
             device_capability = f"{cap.major}.{cap.minor}"
     except Exception:
         pass
-    return {"device_capability": device_capability, "torch_version": torch_version}
+    # Both select the post-load branch for some quant methods (see
+    # _mxfp4_round_trips_via_ipc), so they belong in the fingerprint. Read the
+    # resolved runtime values, not raw server args: the K3 override rewrites
+    # "auto" during resolution.
+    moe_runner_backend = ""
+    moe_a2a_backend = ""
+    try:
+        from sglang.srt.layers.moe import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+
+        moe_runner_backend = str(get_moe_runner_backend().value)
+        moe_a2a_backend = str(get_moe_a2a_backend().value)
+    except Exception:
+        pass
+    return {
+        "device_capability": device_capability,
+        "torch_version": torch_version,
+        "moe_runner_backend": moe_runner_backend,
+        "moe_a2a_backend": moe_a2a_backend,
+    }
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:

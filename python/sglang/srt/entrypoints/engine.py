@@ -717,6 +717,11 @@ class Engine(EngineScoreMixin, EngineBase):
 
         # Validate and clean up stale .ready/.sock files from prior runs.
         # If a daemon is still alive at this rank, raise instead of clobbering.
+        from sglang.srt.layers.moe import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
+        from sglang.srt.weight_cache.daemon import build_daemon_command
         from sglang.srt.weight_cache.protocol import (
             cleanup_stale_daemon_files,
             compute_global_rank,
@@ -739,47 +744,30 @@ class Engine(EngineScoreMixin, EngineBase):
                     base_gpu_id=server_args.base_gpu_id,
                     gpu_id_step=server_args.gpu_id_step,
                 )
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "sglang.srt.weight_cache.daemon",
-                    "--model-path",
-                    get_model().model_path,
-                    "--gpu-id",
-                    str(gpu_id),
-                    "--tp-size",
-                    str(tp_size),
-                    "--tp-rank",
-                    str(tp_rank),
-                    "--pp-size",
-                    str(configured_pp_size()),
-                    "--pp-rank",
-                    str(pp_rank),
-                    "--dp-size",
-                    "1",
-                    "--ep-size",
-                    str(get_parallel().ep_size),
-                    "--load-format",
-                    get_model().load_format,
-                    "--dtype",
-                    get_model().dtype,
-                    "--dist-init-method",
-                    dist_init_method,
-                ]
-                if get_model().quantization:
-                    cmd += ["--quantization", get_model().quantization]
-                if (
-                    server_args.model_loader_extra_config
-                    and server_args.model_loader_extra_config != "{}"
-                ):
-                    cmd += [
-                        "--model-loader-extra-config",
-                        server_args.model_loader_extra_config,
-                    ]
-                if server_args.trust_remote_code:
-                    cmd += ["--trust-remote-code"]
-                if server_args.revision:
-                    cmd += ["--revision", server_args.revision]
+                cmd = build_daemon_command(
+                    python_executable=sys.executable,
+                    model_path=get_model().model_path,
+                    gpu_id=gpu_id,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    pp_size=configured_pp_size(),
+                    pp_rank=pp_rank,
+                    dp_size=1,
+                    ep_size=get_parallel().ep_size,
+                    load_format=get_model().load_format,
+                    dtype=get_model().dtype,
+                    # Both select the post-load branch (MXFP4 only round-trips
+                    # through IPC on the DeepGEMM/MegaMoE one) and both are in
+                    # the CacheConfig fingerprint, so the daemon must resolve
+                    # them exactly as this engine did.
+                    moe_a2a_backend=str(get_moe_a2a_backend().value),
+                    moe_runner_backend=str(get_moe_runner_backend().value),
+                    dist_init_method=dist_init_method,
+                    quantization=get_model().quantization,
+                    model_loader_extra_config=server_args.model_loader_extra_config,
+                    trust_remote_code=server_args.trust_remote_code,
+                    revision=server_args.revision,
+                )
 
                 proc = subprocess.Popen(cmd)
                 daemon_procs.append(proc)

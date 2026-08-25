@@ -39,7 +39,7 @@ import os
 import signal
 import socket
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
@@ -72,6 +72,17 @@ logger = logging.getLogger(__name__)
 # engine ranks indefinitely.
 CLIENT_CONNECTION_TIMEOUT = 30.0
 
+# CPU tensors cannot cross CUDA IPC, so their bytes ride inline in the socket
+# message. Arbitrary; sized to pass K3's 16 KiB vision pos_emb while keeping a
+# stray large CPU tensor from silently bloating every client handshake.
+MAX_INLINE_TENSOR_BYTES = 1 << 20
+
+
+def _describe_oversized(name: str, tensor: "torch.Tensor") -> str:
+    """One line for the refusal listing when a CPU tensor cannot ride inline."""
+    num_bytes = tensor.numel() * tensor.element_size()
+    return f"{name} {tuple(tensor.shape)} {tensor.dtype} ({num_bytes // 1024} KiB)"
+
 
 class WeightCacheDaemon:
     """Persistent GPU weight cache for a single TP rank.
@@ -93,6 +104,8 @@ class WeightCacheDaemon:
         load_format: str = "auto",
         dtype: str = "auto",
         quantization: Optional[str] = None,
+        moe_a2a_backend: str = "none",
+        moe_runner_backend: str = "auto",
         model_loader_extra_config: str = "{}",
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
@@ -109,6 +122,8 @@ class WeightCacheDaemon:
         self.load_format = load_format
         self.dtype = dtype
         self.quantization = quantization
+        self.moe_a2a_backend = moe_a2a_backend
+        self.moe_runner_backend = moe_runner_backend
         self.model_loader_extra_config = model_loader_extra_config
         self.trust_remote_code = trust_remote_code
         self.revision = revision
@@ -123,6 +138,10 @@ class WeightCacheDaemon:
         self.config: Optional[CacheConfig] = None
         # name -> {"handle": base64_str, "shape": list, "dtype": str, "is_param": bool}
         self.state_entries: Dict[str, Dict[str, Any]] = {}
+        # Module names whose MXFP4 post-load built MegaMoE weights; see
+        # _collect_mega_moe_modules.
+        self.mega_moe_modules: List[str] = []
+        self.preloaded_weights_bytes = 0
 
     def _init_distributed(self, server_args, model_config):
         """Initialize the distributed backend required for model loading.
@@ -208,6 +227,7 @@ class WeightCacheDaemon:
         # Lazy imports to avoid circular dependencies and speed up startup
         from sglang.srt.configs.device_config import DeviceConfig
         from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.layers.moe import initialize_moe_config
         from sglang.srt.model_loader.loader import get_model_loader
         from sglang.srt.server_args import ServerArgs
 
@@ -220,10 +240,24 @@ class WeightCacheDaemon:
             pp_size=self.pp_size,
             dp_size=self.dp_size,
             ep_size=self.ep_size,
+            moe_a2a_backend=self.moe_a2a_backend,
+            moe_runner_backend=self.moe_runner_backend,
             load_format=self.load_format,
             model_loader_extra_config=self.model_loader_extra_config,
         )
         publish(server_args, role="weight_cache_daemon")
+        # ServerArgs resolution rewrites the parallel sizes (megamoe spans ep
+        # over tp). The engine fingerprints and shards on the resolved values,
+        # so adopt them here too or the experts shard differently from the
+        # engine that maps them.
+        self.tp_size = server_args.tp_size
+        self.pp_size = server_args.pp_size
+        self.dp_size = server_args.dp_size
+        self.ep_size = server_args.ep_size
+        # The engine does this in Scheduler.init; without it the daemon's
+        # get_moe_{a2a,runner}_backend() lazily report none/auto and both the
+        # IPC quant gate and the env stamp disagree with the engine.
+        initialize_moe_config(server_args)
 
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
@@ -274,6 +308,13 @@ class WeightCacheDaemon:
         # fails fast instead of after minutes of disk I/O.
         check_ipc_quant_support(quant_method, quant_config, where="daemon")
 
+        # Whole-device bytes, not memory_reserved: NCCL cudaMallocs its comm
+        # buffers outside torch's caching allocator, so a reserved-delta sees
+        # neither them nor their release. Sampled before _init_distributed so
+        # the post-teardown delta is everything this daemon leaves resident.
+        current_platform.empty_cache()
+        memory_before_load = self._device_used_bytes()
+
         # Initialize distributed backend (requires server_args + model_config)
         self._init_distributed(server_args, model_config)
 
@@ -307,15 +348,52 @@ class WeightCacheDaemon:
         # memory: clients map these tensors read-only via IPC and would otherwise
         # risk observing half-written weights.
         current_platform.synchronize()
+        current_platform.empty_cache()
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
 
+        # Nothing below this point collectives, and the group's NCCL comm
+        # buffers sit on the device the engine sizes its KV pool against.
+        # After the export: _share_cuda_ needs the allocation, not the group.
+        self._teardown_distributed()
+
+        # After the teardown, so NCCL buffers freed there are not charged to
+        # the engine as resident weight memory.
+        self.preloaded_weights_bytes = max(
+            0, self._device_used_bytes() - memory_before_load
+        )
+
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Exported {len(self.state_entries)} tensors as IPC handles. "
-            f"Ready to serve."
+            f"Exported {len(self.state_entries)} tensors as IPC handles, "
+            f"preloaded_weights_bytes="
+            f"{self.preloaded_weights_bytes / 1024**3:.2f} GB. Ready to serve."
         )
+
+    def _teardown_distributed(self) -> None:
+        """Release the loading-time process group and its NCCL buffers."""
+        from sglang.srt.distributed.parallel_state import (
+            destroy_distributed_environment,
+            destroy_model_parallel,
+        )
+
+        before = self._device_used_bytes()
+        destroy_model_parallel()
+        destroy_distributed_environment()
+        current_platform.synchronize()
+        current_platform.empty_cache()
+        freed = before - self._device_used_bytes()
+        logger.info(
+            f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
+            f"Tore down the loading process group, freeing "
+            f"{freed / 1024**3:.2f} GB for the engine."
+        )
+
+    def _device_used_bytes(self) -> int:
+        """Bytes in use on this GPU, counting every process and allocator."""
+        free, total = torch.cuda.mem_get_info(self.gpu_id)
+        return total - free
 
     @staticmethod
     def _assert_ipc_compatible_allocator() -> None:
@@ -343,6 +421,54 @@ class WeightCacheDaemon:
                         f"engine itself)."
                     )
 
+    @staticmethod
+    def _encode_tensor(tensor):
+        """Encode one tensor as a socket entry, or None if it is too large.
+
+        A CPU tensor cannot cross CUDA IPC: its handle rebuilds through an
+        authkey-checked file descriptor that an unrelated engine process always
+        fails. Small ones ship their bytes inline instead.
+        """
+        entry = {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype).replace("torch.", ""),
+        }
+        if tensor.is_cuda:
+            entry["handle"] = MultiprocessingSerializer.serialize(
+                tensor.data, output_str=True
+            )
+            return entry
+
+        if tensor.numel() * tensor.element_size() > MAX_INLINE_TENSOR_BYTES:
+            return None
+        # view(uint8), not numpy(): numpy has no bfloat16 or float8 dtype.
+        # The client reads it back the same way.
+        entry["data"] = (
+            tensor.detach().contiguous().view(torch.uint8).numpy().tobytes()
+        )
+        return entry
+
+    def _collect_mega_moe_modules(self):
+        """Record which modules the MXFP4 post-load took down the mega branch.
+
+        _mega_moe_weights_built and _mxfp4_backend are plain Python attributes
+        that IPC drops, and they gate build-once short-circuits in every
+        mxfp4_*_moe backend. The client cannot re-derive which modules had them
+        -- structural matching would also hit experts that ran a different
+        branch, silently forcing them onto the mega path -- so the daemon,
+        which knows, names them explicitly.
+        """
+        self.mega_moe_modules = [
+            name
+            for name, module in self.model.named_modules()
+            if getattr(module, "_mega_moe_weights_built", False)
+        ]
+        if self.mega_moe_modules:
+            logger.info(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] "
+                f"{len(self.mega_moe_modules)} modules built MegaMoE weights"
+            )
+
     def _export_state(self):
         """Export model parameters and buffers as CUDA IPC handles.
 
@@ -351,6 +477,7 @@ class WeightCacheDaemon:
         reconstruct the model state via zero-copy IPC.
         """
         self.state_entries.clear()
+        self._collect_mega_moe_modules()
 
         # remove_duplicate=False so tied weights are recognized as parameters
         # under every name. state_dict() below emits both tied keys, and with the
@@ -360,44 +487,57 @@ class WeightCacheDaemon:
             name for name, _ in self.model.named_parameters(remove_duplicate=False)
         )
         state_dict_names = set(self.model.state_dict().keys())
+        oversized_cpu = []
+        inline_count = 0
 
         # Export all items from state_dict (parameters + persistent buffers)
         for name, tensor in self.model.state_dict().items():
-            ipc_handle = MultiprocessingSerializer.serialize(
-                tensor.data, output_str=True
-            )
-            self.state_entries[name] = {
-                "handle": ipc_handle,
-                "shape": list(tensor.shape),
-                "dtype": str(tensor.dtype).replace("torch.", ""),
-                "is_param": name in param_names,
-            }
+            entry = self._encode_tensor(tensor)
+            if entry is None:
+                oversized_cpu.append(_describe_oversized(name, tensor))
+                continue
+            entry["is_param"] = name in param_names
+            inline_count += "data" in entry
+            self.state_entries[name] = entry
 
         # Also export non-persistent buffers (not in state_dict but needed
         # for inference, e.g. rotary embedding cos_sin_cache)
         non_persistent_count = 0
-        for name, buf in self.model.named_buffers():
+        # remove_duplicate=False for the same reason as the parameters above:
+        # a tied buffer must be keyed under every name the client looks up.
+        for name, buf in self.model.named_buffers(remove_duplicate=False):
             if name not in state_dict_names:
-                ipc_handle = MultiprocessingSerializer.serialize(
-                    buf.data, output_str=True
-                )
-                self.state_entries[name] = {
-                    "handle": ipc_handle,
-                    "shape": list(buf.shape),
-                    "dtype": str(buf.dtype).replace("torch.", ""),
-                    "is_param": False,
-                }
+                entry = self._encode_tensor(buf)
+                if entry is None:
+                    oversized_cpu.append(_describe_oversized(name, buf))
+                    continue
+                entry["is_param"] = False
+                inline_count += "data" in entry
+                self.state_entries[name] = entry
                 non_persistent_count += 1
+
+        # Anything too large to ride inline is refused here rather than at the
+        # client's rebuild, where it surfaces as an opaque authkey rejection.
+        if oversized_cpu:
+            listing = "\n  ".join(sorted(oversized_cpu))
+            raise RuntimeError(
+                f"[WeightCacheDaemon gpu={self.gpu_id}] {len(oversized_cpu)} model "
+                f"tensors live on CPU and exceed the "
+                f"{MAX_INLINE_TENSOR_BYTES // 1024} KiB inline limit, so they "
+                f"cannot cross IPC:\n  {listing}\n"
+                f"Disable the weight cache (--weight-cache-mode off) for this model."
+            )
 
         # Log total size
         total_bytes = sum(
-            entry["handle"].__len__() if hasattr(entry["handle"], "__len__") else 0
+            len(entry.get("handle") or entry.get("data") or b"")
             for entry in self.state_entries.values()
         )
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id}] "
             f"Exported {len(self.state_entries)} tensors "
-            f"({non_persistent_count} non-persistent buffers), "
+            f"({non_persistent_count} non-persistent buffers, "
+            f"{inline_count} CPU tensors sent inline), "
             f"serialized handle size ~{total_bytes / 1024 / 1024:.1f} MB"
         )
 
@@ -505,6 +645,8 @@ class WeightCacheDaemon:
                     "status": "ok",
                     "config": self.config.to_dict(),
                     "entries": self.state_entries,
+                    "preloaded_weights_bytes": self.preloaded_weights_bytes,
+                    "mega_moe_modules": self.mega_moe_modules,
                     # PID so the client can watch daemon liveness: if this
                     # process dies while clients hold IPC mappings, their
                     # param.data (and any CUDA-graph-captured addresses) dangle.
@@ -548,6 +690,8 @@ def run_weight_cache_daemon(
     load_format: str = "auto",
     dtype: str = "auto",
     quantization: Optional[str] = None,
+    moe_a2a_backend: str = "none",
+    moe_runner_backend: str = "auto",
     model_loader_extra_config: str = "{}",
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
@@ -579,6 +723,8 @@ def run_weight_cache_daemon(
         load_format=load_format,
         dtype=dtype,
         quantization=quantization,
+        moe_a2a_backend=moe_a2a_backend,
+        moe_runner_backend=moe_runner_backend,
         model_loader_extra_config=model_loader_extra_config,
         trust_remote_code=trust_remote_code,
         revision=revision,
@@ -587,6 +733,76 @@ def run_weight_cache_daemon(
 
     daemon.load()
     daemon.serve()
+
+
+def build_daemon_command(
+    *,
+    python_executable: str,
+    model_path: str,
+    gpu_id: int,
+    tp_size: int,
+    tp_rank: int,
+    pp_size: int,
+    pp_rank: int,
+    dp_size: int,
+    ep_size: int,
+    load_format: str,
+    dtype: str,
+    moe_a2a_backend: str,
+    moe_runner_backend: str,
+    dist_init_method: str,
+    quantization: Optional[str] = None,
+    model_loader_extra_config: str = "{}",
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+) -> List[str]:
+    """Argv for one daemon rank.
+
+    Single source of truth for both launchers. Every argument that reaches the
+    CacheConfig fingerprint must be here: one the engine resolves but does not
+    forward becomes a daemon that loads a different layout and either fails the
+    handshake or, worse, serves weights the client re-derives differently.
+    """
+    cmd = [
+        python_executable,
+        "-m",
+        "sglang.srt.weight_cache.daemon",
+        "--model-path",
+        model_path,
+        "--gpu-id",
+        str(gpu_id),
+        "--tp-size",
+        str(tp_size),
+        "--tp-rank",
+        str(tp_rank),
+        "--pp-size",
+        str(pp_size),
+        "--pp-rank",
+        str(pp_rank),
+        "--dp-size",
+        str(dp_size),
+        "--ep-size",
+        str(ep_size),
+        "--load-format",
+        load_format,
+        "--dtype",
+        dtype,
+        "--moe-a2a-backend",
+        moe_a2a_backend,
+        "--moe-runner-backend",
+        moe_runner_backend,
+        "--dist-init-method",
+        dist_init_method,
+    ]
+    if quantization:
+        cmd += ["--quantization", quantization]
+    if model_loader_extra_config and model_loader_extra_config != "{}":
+        cmd += ["--model-loader-extra-config", model_loader_extra_config]
+    if trust_remote_code:
+        cmd += ["--trust-remote-code"]
+    if revision:
+        cmd += ["--revision", revision]
+    return cmd
 
 
 def launch_weight_cache_daemons(
@@ -602,6 +818,8 @@ def launch_weight_cache_daemons(
     load_format: str = "auto",
     dtype: str = "auto",
     quantization: Optional[str] = None,
+    moe_a2a_backend: str = "none",
+    moe_runner_backend: str = "auto",
     model_loader_extra_config: str = "{}",
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
@@ -669,7 +887,6 @@ def launch_weight_cache_daemons(
         dist_init_method = f"tcp://127.0.0.1:{free_port}"
 
     python_path = sys.executable
-    daemon_module = "sglang.srt.weight_cache.daemon"
 
     # Validate and clean up stale .ready/.sock files from prior runs.
     for pp_rank in pp_rank_range:
@@ -688,41 +905,26 @@ def launch_weight_cache_daemons(
                 base_gpu_id=base_gpu_id,
                 gpu_id_step=gpu_id_step,
             )
-            cmd = [
-                python_path,
-                "-m",
-                daemon_module,
-                "--model-path",
-                model_path,
-                "--gpu-id",
-                str(gpu_id),
-                "--tp-size",
-                str(tp_size),
-                "--tp-rank",
-                str(tp_rank),
-                "--dp-size",
-                str(dp_size),
-                "--ep-size",
-                str(ep_size),
-                "--pp-size",
-                str(pp_size),
-                "--pp-rank",
-                str(pp_rank),
-                "--load-format",
-                load_format,
-                "--dtype",
-                dtype,
-                "--dist-init-method",
-                dist_init_method,
-            ]
-            if quantization:
-                cmd += ["--quantization", quantization]
-            if model_loader_extra_config and model_loader_extra_config != "{}":
-                cmd += ["--model-loader-extra-config", model_loader_extra_config]
-            if trust_remote_code:
-                cmd += ["--trust-remote-code"]
-            if revision:
-                cmd += ["--revision", revision]
+            cmd = build_daemon_command(
+                python_executable=python_path,
+                model_path=model_path,
+                gpu_id=gpu_id,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                pp_size=pp_size,
+                pp_rank=pp_rank,
+                dp_size=dp_size,
+                ep_size=ep_size,
+                load_format=load_format,
+                dtype=dtype,
+                moe_a2a_backend=moe_a2a_backend,
+                moe_runner_backend=moe_runner_backend,
+                dist_init_method=dist_init_method,
+                quantization=quantization,
+                model_loader_extra_config=model_loader_extra_config,
+                trust_remote_code=trust_remote_code,
+                revision=revision,
+            )
 
             proc = subprocess.Popen(cmd)
             procs.append(proc)
@@ -862,6 +1064,18 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", default="auto", help="Model dtype")
     parser.add_argument("--quantization", default=None, help="Quantization method")
     parser.add_argument(
+        "--moe-a2a-backend",
+        default="none",
+        help="MoE all-to-all backend; must match the engine's, since it "
+        "selects which process_weights_after_loading branch runs",
+    )
+    parser.add_argument(
+        "--moe-runner-backend",
+        default="auto",
+        help="MoE runner backend; must match the engine's, since it selects "
+        "which process_weights_after_loading branch runs",
+    )
+    parser.add_argument(
         "--model-loader-extra-config",
         default="{}",
         help="Extra config for model loader (JSON string)",
@@ -915,6 +1129,8 @@ if __name__ == "__main__":
             load_format=args.load_format,
             dtype=args.dtype,
             quantization=args.quantization,
+            moe_a2a_backend=args.moe_a2a_backend,
+            moe_runner_backend=args.moe_runner_backend,
             model_loader_extra_config=args.model_loader_extra_config,
             trust_remote_code=args.trust_remote_code,
             revision=args.revision,
@@ -935,6 +1151,8 @@ if __name__ == "__main__":
             load_format=args.load_format,
             dtype=args.dtype,
             quantization=args.quantization,
+            moe_a2a_backend=args.moe_a2a_backend,
+            moe_runner_backend=args.moe_runner_backend,
             model_loader_extra_config=args.model_loader_extra_config,
             trust_remote_code=args.trust_remote_code,
             revision=args.revision,

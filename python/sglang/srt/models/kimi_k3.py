@@ -214,20 +214,31 @@ def _k3_bf16_gemm(
 
 
 def _merge_weights_as_views(
-    mods: list, pad_rows_to: int = 1
+    mods: list, pad_rows_to: int = 1, merged: Optional[torch.Tensor] = None
 ) -> tuple[torch.Tensor, list[int]]:
     """Cat module weights along dim 0; re-point each module's weight to a view
     of the merged buffer so the original storage is freed (net extra memory ~0).
 
     With pad_rows_to > 1 the merged buffer gets zero rows appended up to the
     next multiple, so every row of the fused GEMM output stays 16-byte aligned
-    for vectorized consumers."""
+    for vectorized consumers.
+
+    `merged` adopts an already-built buffer instead of cat-ing a new one. The
+    IPC weight cache maps the daemon's merged buffer in, and there the cat is a
+    net allocation rather than a swap: the source storage belongs to another
+    process and cannot be freed."""
     ws = [m.weight.data for m in mods]
     sizes = [w.shape[0] for w in ws]
-    pad = (-sum(sizes)) % pad_rows_to
-    if pad:
-        ws = ws + [ws[0].new_zeros((pad, ws[0].shape[1]))]
-    merged = torch.cat(ws, dim=0).contiguous()
+    if merged is None:
+        pad = (-sum(sizes)) % pad_rows_to
+        if pad:
+            ws = ws + [ws[0].new_zeros((pad, ws[0].shape[1]))]
+        merged = torch.cat(ws, dim=0).contiguous()
+    else:
+        expected = sum(sizes) + (-sum(sizes)) % pad_rows_to
+        assert (
+            merged.shape[0] == expected
+        ), f"adopted merged buffer has {merged.shape[0]} rows, expected {expected}"
     off = 0
     for m, n in zip(mods, sizes):
         m.weight.data = merged[off : off + n]
@@ -430,8 +441,9 @@ class KimiK3MoE(nn.Module):
 
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         # Merged front weight ([H, gate_up + E + latent]), built after weight
-        # loading by _merge_front_weights().
-        self._front_w: Optional[torch.Tensor] = None
+        # loading by _merge_front_weights(). Non-persistent so the IPC weight
+        # cache exports it (see _merge_weights_as_views).
+        self.register_buffer("_front_w", None, persistent=False)
         self._front_sizes: Optional[List[int]] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
@@ -668,7 +680,7 @@ class KimiK3MoE(nn.Module):
             and self.routed_expert_up_proj.weight.is_contiguous()
         )
 
-    def _merge_front_weights(self) -> None:
+    def _merge_front_weights(self, adopt_existing: bool = False) -> None:
         """Merge shared gate_up + router gate + latent down_proj weights.
 
         All three GEMMs consume the same hidden_states; at decode each one is a
@@ -679,7 +691,10 @@ class KimiK3MoE(nn.Module):
         Called once from load_weights (after all weights are loaded, before
         cuda graph capture); only plain bf16/fp16 dense weights are merged —
         quantized or mixed-dtype checkpoints keep the unfused path.
-        """
+
+        With adopt_existing the already-populated _front_w is re-used (the IPC
+        weight cache mapped the daemon's buffer in) instead of cat-ing a new
+        one."""
         if not self.use_latent_moe:
             return
         # These merged layouts feed CUDA-only fused front kernels. Keeping the
@@ -707,7 +722,9 @@ class KimiK3MoE(nn.Module):
         dtypes = {m.weight.dtype for m in mods}
         if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
             return
-        self._front_w, self._front_sizes = _merge_weights_as_views(mods)
+        self._front_w, self._front_sizes = _merge_weights_as_views(
+            mods, merged=self._front_w if adopt_existing else None
+        )
         self._front_is_ep_pair = len(mods) == 2
         # Invalidate the cached properties.
         for prop in (
@@ -1476,9 +1493,10 @@ class KimiK3DeltaAttention(nn.Module):
                 prefix=f"{prefix}.f_b_proj",
             )
             # Merged [f_a | b] weight, built after weight loading by
-            # _merge_bfa_weights().
-            self._bfa_w: Optional[torch.Tensor] = None
-            self._bfa_f_b_w: Optional[torch.Tensor] = None
+            # _merge_bfa_weights(). Non-persistent so the IPC weight cache
+            # exports it (see _merge_weights_as_views).
+            self.register_buffer("_bfa_w", None, persistent=False)
+            self.register_buffer("_bfa_f_b_w", None, persistent=False)
         elif self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -1686,7 +1704,7 @@ class KimiK3DeltaAttention(nn.Module):
             g_proj_states = self.g_b_proj(self.g_a_proj(hidden_states)[0])[0]
         return qkv, beta, forget_gate, g_proj_states
 
-    def _merge_bfa_weights(self) -> None:
+    def _merge_bfa_weights(self, adopt_existing: bool = False) -> None:
         """Merge f_a_proj (head_dim outputs) + b_proj (heads/tp outputs).
 
         Both are skinny same-input GEMVs at decode: b lands in a cublas dot
@@ -1696,23 +1714,35 @@ class KimiK3DeltaAttention(nn.Module):
         stays 16-byte aligned for vectorized consumers (tiny-GEMM on f_b).
 
         Called once after weight loading. Block-FP8 inputs are dequantized into
-        the BF16 tiny-GEMM buffers here."""
+        the BF16 tiny-GEMM buffers here.
+
+        With adopt_existing the already-populated buffers are re-used (the IPC
+        weight cache mapped the daemon's in) instead of rebuilt."""
         if not self.use_full_rank_gate:
             return
         if _is_npu:
             return
         mods = [self.f_a_proj, self.b_proj]
         if self._bfa_uses_block_fp8:
-            weights = [_get_k3_dense_weight(mod) for mod in mods]
-            sizes = [weight.shape[0] for weight in weights]
-            pad = (-sum(sizes)) % 8
-            if pad:
-                weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
-            self._bfa_w = torch.cat(weights, dim=0).contiguous()
-            self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
+            if adopt_existing and self._bfa_w is not None:
+                # Dequantization preserves the row count, so the module weights
+                # give sizes without rebuilding the dense buffers.
+                sizes = [mod.weight.shape[0] for mod in mods]
+            else:
+                weights = [_get_k3_dense_weight(mod) for mod in mods]
+                sizes = [weight.shape[0] for weight in weights]
+                pad = (-sum(sizes)) % 8
+                if pad:
+                    weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
+                self._bfa_w = torch.cat(weights, dim=0).contiguous()
+                self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
         else:
-            self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
-            self._bfa_f_b_w = self.f_b_proj.weight
+            self._bfa_w, sizes = _merge_weights_as_views(
+                mods, pad_rows_to=8, merged=self._bfa_w if adopt_existing else None
+            )
+            # .data, not the Parameter: _bfa_f_b_w is a buffer slot and
+            # register_parameter rejects a name that already exists as one.
+            self._bfa_f_b_w = self.f_b_proj.weight.data
         self._bfa_fa_size, self._bfa_b_size = sizes
 
     def _prepare_fused_decode(self) -> None:
@@ -1920,6 +1950,12 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self.o_proj.reduce_results = True
             self.o_proj.use_dp_attention_reduce = True
         k3_gemm_ar.maybe_wrap_o_proj(self.o_proj)
+        # The base class keeps these as plain attributes. Non-persistent
+        # buffers instead, so the IPC weight cache exports them rather than
+        # the client re-running a .contiguous() it cannot pay for.
+        for _absorbed in ("w_kc", "w_vc"):
+            delattr(self, _absorbed)
+            self.register_buffer(_absorbed, None, persistent=False)
         if self.all_reduce_fusion:
             # reduce_results=False was passed through super().__init__ above;
             # the fused all-reduce does the reduce itself and reduces the o_proj
@@ -2770,6 +2806,12 @@ class KimiK3LinearModel(nn.Module):
 class KimiK3LinearForCausalLM(nn.Module):
     """Text-only K3 causal LM."""
 
+    # post_load_weights derives GPU state (w_kc/w_vc, the fused front/BFA
+    # buffers) purely from already loaded weights and never requantizes, so the
+    # IPC weight-cache client may re-run it after mapping the daemon's tensors.
+    # Without this, that state is plain Python attributes IPC cannot carry.
+    ipc_post_load_weights_is_idempotent = True
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -3052,11 +3094,13 @@ class KimiK3LinearForCausalLM(nn.Module):
 
         self.post_load_weights()
 
-    def post_load_weights(self):
+    def post_load_weights(self, adopt_derived_tensors: bool = False):
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get w_kc/w_vc and
         # the fused buffers too. Same pattern as deepseek_v4.
+        # adopt_derived_tensors: the IPC client already mapped w_kc/w_vc and
+        # the fused buffers in; re-derive only what IPC cannot carry.
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
         for layer_id in self.config.full_attention_layer_ids:
             if layer_id >= len(self.model.layers):
@@ -3065,12 +3109,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer, PPMissingLayer):
                 continue
             self_attn = layer.self_attn
-            kv_b_weight = _get_k3_dense_weight(self_attn.kv_b_proj)
-            w_kc, w_vc = kv_b_weight.unflatten(
-                0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
-            ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            if not adopt_derived_tensors:
+                kv_b_weight = _get_k3_dense_weight(self_attn.kv_b_proj)
+                w_kc, w_vc = kv_b_weight.unflatten(
+                    0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+                ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
+                self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+                self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
             if hasattr(self_attn.kv_b_proj, "weight_scale"):
                 self_attn.w_scale = self_attn.kv_b_proj.weight_scale
 
@@ -3099,7 +3144,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer, PPMissingLayer):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
-                layer.mlp._merge_front_weights()
+                layer.mlp._merge_front_weights(adopt_existing=adopt_derived_tensors)
                 # The router consumes the correction bias in fp32; convert the
                 # bf16 checkpoint values once (exact) so the per-call
                 # .to(float32) in topk becomes a no-op instead of one upcast
@@ -3108,7 +3153,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 if bias.dtype != torch.float32:
                     bias.data = bias.data.to(torch.float32)
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
-                layer.self_attn._merge_bfa_weights()
+                layer.self_attn._merge_bfa_weights(adopt_existing=adopt_derived_tensors)
                 layer.self_attn._prepare_fused_decode()
 
         for layer in self.model.layers:
@@ -3135,6 +3180,9 @@ class KimiK3ForConditionalGeneration(nn.Module):
     """K3 multimodal wrapper: MoonViT3d tower + KimiK3LinearForCausalLM."""
 
     supports_cuda_vmm_feature_transport = True
+    # post_load_weights only delegates to the LM tower, which declares itself
+    # safe to re-run; see KimiK3LinearForCausalLM.
+    ipc_post_load_weights_is_idempotent = True
     encoder_media_processor_config = EncoderMediaProcessorConfig(
         image_decode_mode="nvjpeg_fancy",
         preserve_media_metadata=True,
@@ -3200,10 +3248,12 @@ class KimiK3ForConditionalGeneration(nn.Module):
             return
         super().__setattr__(name, value)
 
-    def post_load_weights(self):
+    def post_load_weights(self, adopt_derived_tensors: bool = False):
         # Delegate so DummyModelLoader's post-load hook reaches the LM tower.
         if self.language_model is not None:
-            self.language_model.post_load_weights()
+            self.language_model.post_load_weights(
+                adopt_derived_tensors=adopt_derived_tensors
+            )
 
     def precompile_kernels_after_loading(self) -> None:
         if self.config.language_only:
