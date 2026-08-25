@@ -407,6 +407,27 @@ class PyNcclCommunicator:
     def group_end(self):
         self.nccl.ncclGroupEnd()
 
+    def destroy(self):
+        """Free the NCCL communicator and its device buffers.
+
+        Dropping the Python reference is not enough: NCCL cudaMallocs the comm
+        buffers itself, so they stay resident -- and invisible to torch's
+        caching allocator -- until ncclCommDestroy runs. Collective across the
+        comm's ranks; every rank must call it.
+        """
+        # Gate on `available`, not `disabled`: a healthy comm is disabled by
+        # default and enabled per-call via change_state().
+        if not self.available:
+            return
+        # Disable first so a concurrent collective cannot enter with a comm
+        # that is being torn down, but keep the handle until the destroy
+        # actually succeeds: clearing it on failure would strand the device
+        # buffers with no way to retry and no way to see they are still there.
+        self.disabled = True
+        self.nccl.ncclCommDestroy(self.comm)
+        self.comm = None
+        self.available = False
+
     @contextmanager
     def change_state(self, enable: Optional[bool] = None):
         """

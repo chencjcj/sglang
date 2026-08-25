@@ -1835,14 +1835,24 @@ class GroupCoordinator:
         return tensor
 
     def destroy(self):
+        if self.pynccl_comm is not None:
+            # Before the torch groups: ncclCommDestroy is collective across the
+            # comm's ranks, so it needs the group still alive. A failure here
+            # leaks the comm's device buffers for the life of the process;
+            # logged rather than raised so it cannot skip the teardown below.
+            try:
+                self.pynccl_comm.destroy()
+            except Exception:
+                logger.exception(
+                    "ncclCommDestroy failed; leaking its device buffers."
+                )
+            self.pynccl_comm = None
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
         if self.cpu_group is not None:
             torch.distributed.destroy_process_group(self.cpu_group)
             self.cpu_group = None
-        if self.pynccl_comm is not None:
-            self.pynccl_comm = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
         if self.ca_comm is not None:
