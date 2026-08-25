@@ -238,6 +238,7 @@ def maybe_enable_ipc_weight_cache(
     tp_size: int,
     pp_rank: int,
     tp_rank: int,
+    is_draft_worker: bool = False,
 ) -> None:
     """Switch ``load_config`` onto the IPC weight-cache path, in place.
 
@@ -245,6 +246,10 @@ def maybe_enable_ipc_weight_cache(
     disk fallback) and derives the per-rank daemon socket if unset. Idempotent:
     the format swap is guarded on ``!= IPC_CACHE`` so a second call (e.g. a
     weight reload) can't overwrite the captured fallback format.
+
+    The draft worker resolves the "_draft" socket: target and draft are
+    different nn.Modules from different checkpoints, each served by its own
+    daemon on the same GPU.
     """
     if server_args.weight_cache_mode == "off":
         return
@@ -252,6 +257,7 @@ def maybe_enable_ipc_weight_cache(
     if load_config.load_format != LoadFormat.IPC_CACHE:
         load_config.fallback_load_format = load_config.load_format
         load_config.load_format = LoadFormat.IPC_CACHE
+    load_config.weight_cache_is_draft = is_draft_worker
 
     # Compute socket path using global rank (tp_size * pp_rank + tp_rank) so
     # each daemon has a unique socket even across PP stages and nodes.
@@ -262,7 +268,9 @@ def maybe_enable_ipc_weight_cache(
         )
 
         global_rank = compute_global_rank(tp_size, pp_rank, tp_rank)
-        load_config.weight_cache_socket = get_socket_path(global_rank=global_rank)
+        load_config.weight_cache_socket = get_socket_path(
+            global_rank=global_rank, is_draft_model=is_draft_worker
+        )
 
 
 def load_model_with_memory_saver(

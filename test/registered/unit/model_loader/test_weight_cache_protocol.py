@@ -26,6 +26,7 @@ from sglang.srt.weight_cache.protocol import (
     IPC_QUANT_ALLOWLIST,
     CacheConfig,
     UnsupportedQuantForIPCError,
+    build_daemon_model_specs,
     check_ipc_quant_support,
     cleanup_stale_daemon_files,
     compute_global_rank,
@@ -133,6 +134,8 @@ class TestCacheConfig(CustomTestCase):
             # exportable MegaMoE layout on --moe-a2a-backend megamoe even when
             # the runner stays "auto" (mxfp4.py: use_mega_moe).
             ("moe_a2a_backend", "megamoe"),
+            # Target and draft are different nn.Modules on the same rank.
+            ("is_draft_model", True),
         ):
             self.assertFalse(
                 base.matches(_make_cache_config(**{field: value})),
@@ -197,6 +200,60 @@ class TestGlobalRankAndPaths(CustomTestCase):
         self.assertTrue(get_socket_path(3).endswith("rank3.sock"))
         self.assertTrue(get_ready_path(3).endswith("rank3.ready"))
 
+    def test_draft_paths_never_collide_with_the_target(self):
+        # A rank's target and draft daemons run on the same GPU, so their
+        # sockets must differ; the target path stays byte-identical to the
+        # pre-draft one so existing daemons keep working.
+        self.assertTrue(get_socket_path(3).endswith("rank3.sock"))
+        self.assertTrue(
+            get_socket_path(3, is_draft_model=True).endswith("rank3_draft.sock")
+        )
+        self.assertNotEqual(
+            get_ready_path(3), get_ready_path(3, is_draft_model=True)
+        )
+
+    def test_draft_specs_mirror_model_config_fallbacks(self):
+        specs = build_daemon_model_specs(
+            model_path="/models/target",
+            quantization="fp8",
+            revision="v1",
+            target_dist_init_method="tcp://127.0.0.1:1",
+            speculative_algorithm="DSPARK",
+            speculative_draft_model_path="/models/draft",
+            draft_dist_init_method="tcp://127.0.0.1:2",
+        )
+        target, draft = specs
+        self.assertFalse(target.is_draft_model)
+        self.assertTrue(draft.is_draft_model)
+        self.assertEqual(draft.model_path, "/models/draft")
+        # Quantization does NOT fall back to the target's, revision does --
+        # mirroring ModelConfig.from_server_args.
+        self.assertIsNone(draft.quantization)
+        self.assertEqual(draft.revision, "v1")
+        # Separate process groups: one shared rendezvous would deadlock them.
+        self.assertNotEqual(target.dist_init_method, draft.dist_init_method)
+
+    def test_no_draft_spec_without_speculation(self):
+        specs = build_daemon_model_specs(
+            model_path="/models/target",
+            quantization=None,
+            revision=None,
+            target_dist_init_method="tcp://127.0.0.1:1",
+        )
+        self.assertEqual(len(specs), 1)
+        self.assertFalse(specs[0].is_draft_model)
+
+    def test_draft_without_rendezvous_is_rejected(self):
+        with self.assertRaises(ValueError):
+            build_daemon_model_specs(
+                model_path="/models/target",
+                quantization=None,
+                revision=None,
+                target_dist_init_method="tcp://127.0.0.1:1",
+                speculative_algorithm="DSPARK",
+            )
+
+
 class TestDaemonCommand(CustomTestCase):
     """Every fingerprinted setting must reach the spawned daemon.
 
@@ -242,9 +299,23 @@ class TestDaemonCommand(CustomTestCase):
             "--quantization",
             "--trust-remote-code",
             "--revision",
+            "--is-draft-model",
+            "--speculative-algorithm",
             "--model-loader-extra-config",
         ):
             self.assertNotIn(flag, cmd)
+
+    def test_draft_flags(self):
+        cmd = self._cmd(
+            model_path="/models/draft",
+            is_draft_model=True,
+            speculative_algorithm="DSPARK",
+        )
+        self.assertIn("--is-draft-model", cmd)
+        self.assertEqual(
+            self._flag_value(cmd, "--speculative-algorithm"), "DSPARK"
+        )
+        self.assertEqual(self._flag_value(cmd, "--model-path"), "/models/draft")
 
     def test_empty_loader_config_is_not_forwarded(self):
         # "{}" is the default, not a user setting; forwarding it is noise.

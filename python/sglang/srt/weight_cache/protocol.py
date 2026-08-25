@@ -11,7 +11,7 @@ import os
 import pickle
 import signal
 import struct
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import msgspec
 
@@ -20,11 +20,13 @@ from sglang.srt.utils.common import safe_pickle_loads
 logger = logging.getLogger(__name__)
 
 # Socket path template for weight cache daemons (keyed by global rank
-# = tp_size * pp_rank + tp_rank, so multi-node / multi-PP don't collide)
-WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.sock"
+# = tp_size * pp_rank + tp_rank, so multi-node / multi-PP don't collide;
+# ``role`` is "" for the target model and "_draft" for a speculative draft
+# model, so a target daemon and a draft daemon can coexist on one GPU)
+WEIGHT_CACHE_SOCKET_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}{role}.sock"
 
 # Ready file template — daemon writes this after loading completes
-WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}.ready"
+WEIGHT_CACHE_READY_TEMPLATE = "/tmp/sglang_weight_cache_rank{global_rank}{role}.ready"
 
 
 class CacheConfig(msgspec.Struct):
@@ -58,6 +60,10 @@ class CacheConfig(msgspec.Struct):
     # that resolved either differently must not share weights.
     moe_runner_backend: str = ""
     moe_a2a_backend: str = ""
+    # Speculative decoding: True for a draft-model daemon. The draft is a
+    # different nn.Module loaded from a different checkpoint, so target and
+    # draft handles must never cross-match even on the same GPU and rank.
+    is_draft_model: bool = False
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -416,20 +422,95 @@ def compute_local_gpu_id(
     )
 
 
-def get_socket_path(global_rank: int) -> str:
+def format_daemon_role(is_draft_model: bool = False) -> str:
+    """Path suffix keeping a rank's target and draft daemons off one socket."""
+    return "_draft" if is_draft_model else ""
+
+
+class DaemonModelSpec(msgspec.Struct, frozen=True):
+    """Identity of one model a per-rank weight cache daemon set holds.
+
+    Target and draft form separate process groups, hence the per-spec
+    rendezvous: sharing one would deadlock the two groups.
+    """
+
+    is_draft_model: bool
+    model_path: str
+    quantization: Optional[str]
+    revision: Optional[str]
+    dist_init_method: str
+
+    @property
+    def role(self) -> str:
+        return format_daemon_role(self.is_draft_model)
+
+
+def build_daemon_model_specs(
+    *,
+    model_path: str,
+    quantization: Optional[str],
+    revision: Optional[str],
+    target_dist_init_method: str,
+    speculative_algorithm: Optional[str] = None,
+    speculative_draft_model_path: Optional[str] = None,
+    speculative_draft_model_quantization: Optional[str] = None,
+    speculative_draft_model_revision: Optional[str] = None,
+    draft_dist_init_method: Optional[str] = None,
+) -> List[DaemonModelSpec]:
+    """The per-rank daemon set: the target, plus the draft under speculation.
+
+    The draft fallbacks mirror ModelConfig.from_server_args -- path falls back
+    to the target's, quantization does NOT, revision does -- so the daemon's
+    CacheConfig cannot drift from the draft worker's.
+    """
+    specs = [
+        DaemonModelSpec(
+            is_draft_model=False,
+            model_path=model_path,
+            quantization=quantization,
+            revision=revision,
+            dist_init_method=target_dist_init_method,
+        )
+    ]
+    if speculative_algorithm is None:
+        return specs
+
+    if draft_dist_init_method is None:
+        raise ValueError(
+            "draft_dist_init_method is required when speculative decoding is "
+            "enabled: the draft daemons form their own process group and "
+            "cannot share the target daemons' rendezvous endpoint."
+        )
+    specs.append(
+        DaemonModelSpec(
+            is_draft_model=True,
+            model_path=speculative_draft_model_path or model_path,
+            quantization=speculative_draft_model_quantization,
+            revision=speculative_draft_model_revision or revision,
+            dist_init_method=draft_dist_init_method,
+        )
+    )
+    return specs
+
+
+def get_socket_path(global_rank: int, *, is_draft_model: bool = False) -> str:
     """Get the Unix socket path for a weight cache daemon.
 
     global_rank = tp_size * pp_rank + tp_rank
     """
-    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(global_rank=global_rank)
+    return WEIGHT_CACHE_SOCKET_TEMPLATE.format(
+        global_rank=global_rank, role=format_daemon_role(is_draft_model)
+    )
 
 
-def get_ready_path(global_rank: int) -> str:
+def get_ready_path(global_rank: int, *, is_draft_model: bool = False) -> str:
     """Get the ready-file path for a weight cache daemon.
 
     global_rank = tp_size * pp_rank + tp_rank
     """
-    return WEIGHT_CACHE_READY_TEMPLATE.format(global_rank=global_rank)
+    return WEIGHT_CACHE_READY_TEMPLATE.format(
+        global_rank=global_rank, role=format_daemon_role(is_draft_model)
+    )
 
 
 def _read_ready_pid(ready_path: str) -> Optional[int]:
@@ -455,7 +536,9 @@ def _is_pid_alive(pid: int) -> bool:
         return True
 
 
-def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None:
+def cleanup_stale_daemon_files(
+    global_rank: int, *, force: bool = False, is_draft_model: bool = False
+) -> None:
     """Validate and clean up .ready/.sock files for a daemon rank.
 
     If the .ready file exists and the recorded PID is still alive, the daemon
@@ -465,8 +548,8 @@ def cleanup_stale_daemon_files(global_rank: int, *, force: bool = False) -> None
     If the PID is dead (or unreadable), the files are stale leftovers from a
     crashed/killed daemon and are safe to remove.
     """
-    ready_path = get_ready_path(global_rank)
-    socket_path = get_socket_path(global_rank)
+    ready_path = get_ready_path(global_rank, is_draft_model=is_draft_model)
+    socket_path = get_socket_path(global_rank, is_draft_model=is_draft_model)
 
     if not os.path.exists(ready_path) and not os.path.exists(socket_path):
         return

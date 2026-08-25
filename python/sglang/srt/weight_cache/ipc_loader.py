@@ -296,13 +296,18 @@ class IpcModelLoader(BaseModelLoader):
         short-circuits -- forcing them on is a silent numerics error.
 
         Mxfp4MoEMethod.process_weights_after_loading repoints w13/w2 weight and
-        scale params at the mega tensors themselves, so every mega byte reaches
-        us through state_dict(). What does not is the Python-side aliasing:
-        mega_l{1,2}_weights are plain tuples the mega path reads directly.
+        scale params at the mega tensors themselves (mxfp4.py, the use_mega_moe
+        branch: layer.w13_weight_scale.data = l1_pair[1]), so every mega byte
+        reaches us through state_dict(). What does not is the Python-side
+        aliasing: mega_l{1,2}_weights are plain tuples that the mega path reads
+        directly. Re-pointing them at the mapped params restores it exactly.
 
         Do NOT re-run the UTCCP transpose here: the params already hold the
         transposed layout, so a second pass would serve doubly-transposed
         scales and allocate a full extra copy on top of the mapped originals.
+        The other builder (mega_moe.build_mega_moe_experts_weights) does keep a
+        separate UTCCP tensor, but it names its params w13_weight_scale_inv and
+        is not this branch.
         """
         if not mega_moe_modules:
             return 0
@@ -501,7 +506,9 @@ class IpcModelLoader(BaseModelLoader):
                     ref_param = existing_params[name]
                 else:
                     ref_param = existing_buffers[name]
-                imported_bytes = imported_tensor.numel() * imported_tensor.element_size()
+                imported_bytes = (
+                    imported_tensor.numel() * imported_tensor.element_size()
+                )
                 ref_bytes = ref_param.numel() * ref_param.element_size()
                 if imported_bytes != ref_bytes:
                     mismatched.append(
@@ -663,6 +670,9 @@ class IpcModelLoader(BaseModelLoader):
                 quant_config_hash=hash_quant_config(quant_config),
                 dtype=str(model_config.dtype),
                 revision=model_config.revision or "",
+                # Off the ModelConfig, not a loader flag, so it cannot drift
+                # from the model actually being loaded.
+                is_draft_model=model_config.is_draft_model,
                 **compute_env_stamp(),
             )
 
@@ -673,7 +683,8 @@ class IpcModelLoader(BaseModelLoader):
                 f"arch={engine_config.model_arch}, "
                 f"tp={engine_config.tp_size}/{engine_config.tp_rank}, "
                 f"quant={engine_config.quant_method}, "
-                f"dtype={engine_config.dtype}"
+                f"dtype={engine_config.dtype}, "
+                f"role={'draft' if engine_config.is_draft_model else 'target'}"
             )
 
             send_msg(sock, {"type": "fetch_state", "config": engine_config.to_dict()})

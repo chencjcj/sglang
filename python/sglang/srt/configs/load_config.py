@@ -109,6 +109,10 @@ class LoadConfig:
     # Weight cache daemon options
     weight_cache_mode: str = "off"  # "off", "daemon", "client"
     weight_cache_socket: Optional[str] = None  # Path to daemon socket (for client mode)
+    # True when this load is the speculative draft model, which is served by
+    # its own daemon on the "_draft" socket. Distinct from draft_model_idx,
+    # which stays None on the single-draft path.
+    weight_cache_is_draft: bool = False
     fallback_load_format: Union[str, "LoadFormat"] = LoadFormat.AUTO
 
     def __post_init__(self):

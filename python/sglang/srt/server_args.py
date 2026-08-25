@@ -7697,15 +7697,18 @@ class ServerArgs:
                 "that selects IPC loading automatically."
             )
 
-        # Speculative decoding loads an extra draft model whose weights the
-        # daemon does not export, so refuse the combination up front instead of
-        # failing deep inside draft-worker load (draft-model daemon TBD).
-        if self.weight_cache_mode != "off" and self.speculative_algorithm is not None:
+        # weight_cache_mode=daemon spawns only the target daemon set, so the
+        # draft worker would find no daemon on its "_draft" socket and fall
+        # back to a disk load on a GPU the daemon already fills. Client mode
+        # is fine: the standalone launcher starts both sets.
+        if self.weight_cache_mode == "daemon" and self.speculative_algorithm is not None:
             raise ValueError(
-                "--weight-cache-mode is not supported together with speculative "
-                "decoding (--speculative-algorithm): the weight cache daemon does "
-                "not export the draft model's weights. Disable one of them "
-                "(--weight-cache-mode off) for this configuration."
+                "--weight-cache-mode daemon is not supported together with "
+                "speculative decoding (--speculative-algorithm): this mode "
+                "launches only the target daemon. Launch the daemons "
+                "standalone (python -m sglang.srt.weight_cache.daemon "
+                "--speculative-algorithm ...) and use "
+                "--weight-cache-mode client instead."
             )
 
     def _is_mistral_native_format(self) -> bool:

@@ -1101,6 +1101,7 @@ class ModelRunner:
             tp_size=self.ps.tp_size,
             pp_rank=self.ps.pp_rank,
             tp_rank=self.ps.tp_rank,
+            is_draft_worker=self.is_draft_worker,
         )
         if self.device == "cpu":
             self.model_config = adjust_config_with_unaligned_cpu_tp(
