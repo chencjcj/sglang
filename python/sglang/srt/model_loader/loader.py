@@ -12,6 +12,7 @@ import fnmatch
 import gc
 import glob
 import hashlib
+import inspect
 import json
 import logging
 import math
@@ -346,12 +347,21 @@ def _initialize_model(
     return model_class(**kwargs)
 
 
-def _post_load_weights(model: nn.Module) -> None:
+def _post_load_weights(model: nn.Module, adopt_derived_tensors: bool = False) -> None:
     # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
     # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
     # would normally do it internally. NextN subclasses override the method to fill in
     # `is_nextn=True`, so the loader doesn't need to know.
-    if hasattr(model, "post_load_weights"):
+    if not hasattr(model, "post_load_weights"):
+        return
+    # Only some models take it, and the signatures differ otherwise.
+    if (
+        adopt_derived_tensors
+        and "adopt_derived_tensors"
+        in inspect.signature(model.post_load_weights).parameters
+    ):
+        model.post_load_weights(adopt_derived_tensors=True)
+    else:
         model.post_load_weights()
 
 
@@ -3316,14 +3326,17 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         # The seed's bytes land straight in these parameters, so the layout has
         # to match its post-load one: mxfp4 rewrites bias bf16 -> fp32, scales
-        # uint8 -> float8_e4m3fn, and shuffles experts. The transforms are
-        # structural, so zeroed weights still yield the right layout.
+        # uint8 -> float8_e4m3fn, and shuffles experts, and post_load_weights
+        # folds parameters into derived buffers (K3's f_b_proj into _bfa_f_b_w).
+        # The transforms are structural, so zeroed weights still yield the
+        # right layout.
         if (
             load_config.remote_instance_weight_loader_backend
             != RemoteInstanceWeightLoaderBackend.MODELEXPRESS
         ):
             post_tic = time.time()
             _process_weights_after_loading(model, torch.device(device_config.device))
+            _post_load_weights(model)
             logger.info(
                 "Matched the seed's post-load weight layout in %.2fs.",
                 time.time() - post_tic,
@@ -3527,7 +3540,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
                 )
             current_platform.synchronize()
 
-            _post_load_weights(model)
+            # Same as the transfer-engine path: the buffers were part of the
+            # layout the broadcast just filled.
+            _post_load_weights(model, adopt_derived_tensors=True)
         end_get_weights_tic = time.time()
         logger.debug(
             f"finish getting all weights from remote instance, time used: {(end_get_weights_tic - start_get_weights_tic):.4f}s"
@@ -3601,7 +3616,9 @@ class RemoteInstanceModelLoader(BaseModelLoader):
             len(client_len_list),
         )
 
-        _post_load_weights(model)
+        # The buffers were part of the layout the transfer just filled, so
+        # adopt them rather than rebuilding from parameters they superseded.
+        _post_load_weights(model, adopt_derived_tensors=True)
 
         return True
 
