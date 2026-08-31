@@ -35,7 +35,7 @@ with patch.dict(
         CompressionLevelMetadata,
     )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 
 
 def _compression_layout():
